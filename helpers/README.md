@@ -51,6 +51,15 @@ imported/trips/winter-is-coming/
 - `--verbose`, `-v`: Enable verbose logging for debugging
 - `--no-browser`: Skip Playwright browser automation and use requests only (may miss dynamically loaded content)
 
+#### Authentication Options (for private trips)
+
+- `--cookies FILE`: Path to a cookie file (JSON or Netscape format) exported from your browser
+- `--interactive-login`: Opens a Playwright browser window where you can log in manually
+- `--login-email EMAIL`: Email address for programmatic login (requires `--login-password`)
+- `--login-password PASSWORD`: Password for programmatic login
+- `--login-env`: Read credentials from `FINDPENGUINS_EMAIL` and `FINDPENGUINS_PASSWORD` environment variables
+- `--save-cookies FILE`: Save cookies to a file after login for later reuse with `--cookies`
+
 ### Examples
 
 ```bash
@@ -62,6 +71,29 @@ python helpers/findpenguins_scraper.py https://findpenguins.com/username/trip/my
 
 # Verbose output for debugging
 python helpers/findpenguins_scraper.py https://findpenguins.com/username/trip/my-trip -v
+
+### Authentication Examples
+
+```bash
+# 1. Cookie file (exported from browser via "EditThisCookie" / "Get cookies.txt LOCALLY")
+python helpers/findpenguins_scraper.py https://findpenguins.com/username/trip/private-trip --cookies cookies.json
+
+# 2. Interactive login (opens browser window, log in manually)
+python helpers/findpenguins_scraper.py https://findpenguins.com/username/trip/private-trip --interactive-login
+
+# 3. Login with email and password (programmatic)
+python helpers/findpenguins_scraper.py https://findpenguins.com/username/trip/private-trip --login-email user@example.com --login-password "yourpassword"
+
+# 4. Login via environment variables (safer - no password in history)
+export FINDPENGUINS_EMAIL="user@example.com"
+export FINDPENGUINS_PASSWORD="yourpassword"
+python helpers/findpenguins_scraper.py https://findpenguins.com/username/trip/private-trip --login-env
+
+# 5. Interactive login + save cookies for future reuse (login once, reuse many times)
+python helpers/findpenguins_scraper.py https://findpenguins.com/username/trip/private-trip --interactive-login --save-cookies cookies.json
+
+# Later runs (no login needed):
+python helpers/findpenguins_scraper.py https://findpenguins.com/username/trip/other-private-trip --cookies cookies.json
 ```
 
 ### What Gets Scraped
@@ -112,7 +144,8 @@ python -m tracevoyage_gen build --data data --assets assets
 ### Limitations
 
 - The scraper works best with publicly accessible FindPenguins trips
-- Private trips may require authentication (not currently supported)
+- Private trips require authentication (use `--cookies`, `--interactive-login`, or `--login-email` options)
+- The FindPenguins login page structure may change - if login fails, the selectors in `_playwright_login()` may need updating
 - Image quality depends on what's available in the source
 - Some metadata may not be available depending on the trip's privacy settings
 

@@ -20,6 +20,7 @@ This will create:
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -41,6 +42,12 @@ try:
     HAS_PLAYWRIGHT = True
 except ImportError:
     HAS_PLAYWRIGHT = False
+
+try:
+    from http.cookiejar import MozillaCookieJar
+    HAS_COOKIEJAR = True
+except ImportError:
+    HAS_COOKIEJAR = False
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -87,6 +94,283 @@ def _suffix_from_url(url: str) -> str:
         return suffix
     return ".jpg"
 
+
+# ──────────────────────────────────────────────
+# Login & Cookie handling
+# ──────────────────────────────────────────────
+
+
+def _load_cookies_from_json(path: Path, session: requests.Session) -> None:
+    """Load cookies from a JSON file (e.g. EditThisCookie / Get cookies.txt LOCALLY export).
+
+    Supports two formats:
+      1. List of dicts with keys: name, value, domain, path, httpOnly, secure, sameSite
+      2. Single dict with 'cookies' key containing such a list
+         (Netscape.txt export from "Get cookies.txt LOCALLY")
+    """
+    raw = json.loads(path.read_text(encoding='utf-8'))
+    cookies_list = raw.get('cookies', raw) if isinstance(raw, dict) else raw
+
+    if isinstance(cookies_list, dict):
+        # Simple name → value dict format
+        for name, value in cookies_list.items():
+            session.cookies.set(name, value)
+        return
+
+    for c in cookies_list:
+        if not isinstance(c, dict):
+            continue
+        name = c.get('name', '')
+        value = c.get('value', '')
+        if not name:
+            continue
+        kwargs = {
+            'domain': c.get('domain', ''),
+            'path': c.get('path', '/'),
+        }
+        # httpOnly is sometimes stored as string
+        if c.get('httpOnly') in (True, 'true', 'True'):
+            kwargs['rest'] = {'HttpOnly': None}
+        session.cookies.set(name, value, **kwargs)
+    log.info(f"Loaded {len(cookies_list)} cookies from {path}")
+
+
+def _load_cookies_netscape(path: Path, session: requests.Session) -> None:
+    """Load cookies in Netscape cookie file format (cookies.txt)."""
+    if not HAS_COOKIEJAR:
+        log.warning("http.cookiejar not available, can't load Netscape format")
+        return
+    jar = MozillaCookieJar(str(path))
+    jar.load(ignore_discard=True, ignore_expires=True)
+    for c in jar:
+        session.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
+    log.info(f"Loaded {len(jar)} cookies from {path}")
+
+
+def load_cookies(path: Path, session: requests.Session) -> None:
+    """Detect cookie file format and load into the requests session."""
+    if not path.exists():
+        log.warning(f"Cookie file not found: {path}")
+        return
+    content = path.read_text(encoding='utf-8', errors='replace').strip()
+    if not content:
+        return
+    # Detect format by looking at first non-empty line
+    first_line = content.split('\n')[0].strip()
+    if first_line.startswith('#') or first_line.startswith('.'):
+        # Netscape format (cookies.txt)
+        _load_cookies_netscape(path, session)
+    else:
+        # Assume JSON
+        _load_cookies_from_json(path, session)
+
+
+def _save_cookies(session: requests.Session, path: Path) -> None:
+    """Save cookies from the requests session to a JSON file for reuse."""
+    cookies_list = []
+    for c in session.cookies:
+        cookies_list.append({
+            'name': c.name,
+            'value': c.value,
+            'domain': c.domain,
+            'path': c.path,
+        })
+    path.write_text(
+        json.dumps({'cookies': cookies_list}, indent=2, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    log.info(f"Saved {len(cookies_list)} cookies to {path}")
+
+
+def _playwright_login(
+    login_url: str,
+    email: str | None = None,
+    password: str | None = None,
+    interactive: bool = False,
+    cookie_path: Path | None = None,
+) -> list[dict] | None:
+    """Log in to FindPenguins via Playwright.
+
+    Args:
+        login_url: The login page URL.
+        email: Email for programmatic login.
+        password: Password for programmatic login.
+        interactive: If True, open browser and let user log in manually.
+        cookie_path: If provided, save cookies after login.
+
+    Returns:
+        List of cookie dicts compatible with requests session, or None on failure.
+    """
+    if not HAS_PLAYWRIGHT:
+        log.error("Playwright is required for login. Install with: pip install playwright && playwright install chromium")
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=not interactive,
+                slow_mo=50 if interactive else None,
+            )
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            )
+            page = context.new_page()
+            page.goto(login_url, wait_until='networkidle', timeout=60000)
+
+            # Close cookie popup if present
+            try:
+                cookie_accept = page.locator('a[onclick*="acceptCookies"], button:has-text("Accept"), button:has-text("Alle")')
+                if cookie_accept.count() > 0:
+                    log.debug("  Accepting cookies popup")
+                    cookie_accept.first.click()
+                    page.wait_for_timeout(500)
+            except Exception:
+                pass
+
+            if interactive:
+                log.info("=" * 60)
+                log.info("INTERACTIVE LOGIN MODE")
+                log.info("A browser window has opened. Please log in manually.")
+                log.info("After logging in, press Enter in this terminal to continue...")
+                log.info("=" * 60)
+                input("Press Enter after you have logged in...")
+            elif email and password:
+                log.info("Attempting programmatic login...")
+                # Try common FindPenguins login form selectors
+                email_input = page.locator('input[type="email"], input[name="email"], input[name="login"], input[placeholder*="email" i], input[placeholder*="Email" i]')
+                password_input = page.locator('input[type="password"], input[name="password"], input[placeholder*="password" i], input[placeholder*="Passwort" i]')
+
+                if email_input.count() == 0 or password_input.count() == 0:
+                    log.warning("Could not find login form fields on the page.")
+                    log.warning("The login page structure may have changed.")
+                    browser.close()
+                    return None
+
+                email_input.first.fill(email)
+                password_input.first.fill(password)
+
+                # Try various submit button selectors
+                submit_btn = page.locator(
+                    'button[type="submit"], '
+                    'input[type="submit"], '
+                    'button:has-text("Log in"), '
+                    'button:has-text("Sign in"), '
+                    'button:has-text("Anmelden"), '
+                    'a:has-text("Log in"), '
+                    'button:has-text("Login")'
+                )
+                if submit_btn.count() > 0:
+                    submit_btn.first.click()
+                else:
+                    # Fallback: press Enter on password field
+                    password_input.first.press('Enter')
+
+                # Wait for navigation/redirect
+                page.wait_for_timeout(5000)
+                try:
+                    page.wait_for_url(
+                        lambda url: '/login' not in url and '/auth' not in url,
+                        timeout=15000,
+                    )
+                except Exception:
+                    log.warning("Login may have failed - still on login page after submission.")
+                    # Check for error messages
+                    error = page.locator('.error, .alert, .notification-error, [class*="error"]')
+                    if error.count() > 0:
+                        log.warning(f"Login error: {error.first.text_content()}")
+
+            # Save cookies from Playwright context
+            playwright_cookies = context.cookies()
+            if not playwright_cookies:
+                log.warning("No cookies found after login attempt.")
+                browser.close()
+                return None
+
+            log.info(f"Got {len(playwright_cookies)} cookies from browser session")
+
+            # Save to file if path provided
+            if cookie_path:
+                cookie_path.parent.mkdir(parents=True, exist_ok=True)
+                cookie_path.write_text(
+                    json.dumps({'cookies': playwright_cookies}, indent=2, ensure_ascii=False),
+                    encoding='utf-8',
+                )
+                log.info(f"Cookies saved to {cookie_path}")
+
+            # Convert Playwright cookies to requests-session compatible format
+            result = []
+            for c in playwright_cookies:
+                cookie = {
+                    'name': c['name'],
+                    'value': c['value'],
+                    'domain': c.get('domain', ''),
+                    'path': c.get('path', '/'),
+                }
+                if c.get('httpOnly', False):
+                    cookie['rest'] = {'HttpOnly': None}
+                result.append(cookie)
+
+            browser.close()
+            return result
+
+    except Exception as e:
+        log.error(f"Playwright login failed: {e}", exc_info=True)
+        return None
+
+
+def _apply_cookies_to_playwright_context(
+    context: 'Any',
+    cookies_path: Path,
+    target_domain: str,
+) -> None:
+    """Load cookies from a JSON file and apply them to a Playwright browser context."""
+    raw = json.loads(cookies_path.read_text(encoding='utf-8'))
+    cookies_list = raw.get('cookies', raw) if isinstance(raw, dict) else raw
+    if isinstance(cookies_list, dict):
+        # Simple name → value dict: skip (can't set domain)
+        log.warning("Simple dict cookie format not supported for Playwright; use list format.")
+        return
+
+    pw_cookies = []
+    for c in cookies_list:
+        if not isinstance(c, dict) or not c.get('name'):
+            continue
+        cookie = {
+            'name': c['name'],
+            'value': c.get('value', ''),
+            'domain': c.get('domain', target_domain),
+            'path': c.get('path', '/'),
+        }
+        if c.get('httpOnly') in (True, 'true', 'True'):
+            cookie['httpOnly'] = True
+        if c.get('secure') in (True, 'true', 'True'):
+            cookie['secure'] = True
+        pw_cookies.append(cookie)
+
+    if pw_cookies:
+        context.add_cookies(pw_cookies)
+        log.info(f"Applied {len(pw_cookies)} cookies to Playwright browser context")
+
+
+def _apply_playwright_cookies_to_session(
+    cookies: list[dict],
+    session: requests.Session,
+) -> None:
+    """Apply a list of cookie dicts (from Playwright) to a requests Session."""
+    for c in cookies:
+        name = c.get('name', '')
+        value = c.get('value', '')
+        if not name:
+            continue
+        kwargs = {
+            'domain': c.get('domain', ''),
+            'path': c.get('path', '/'),
+        }
+        session.cookies.set(name, value, **kwargs)
+    log.info(f"Applied {len(cookies)} cookies to requests session")
+
+
+# ──────────────────────────────────────────────
 
 def _parse_desc_span(desc_span: Tag) -> dict[str, Any]:
     """Parse the .desc span that contains date, country, and weather.
@@ -204,8 +488,16 @@ def _extract_photos(article: Tag, base_url: str) -> list[dict[str, str]]:
     return photos
 
 
-def _fetch_page_with_playwright(url: str) -> str | None:
+def _fetch_page_with_playwright(
+    url: str,
+    cookie_file: Path | None = None,
+) -> str | None:
     """Fetch a trip page using Playwright to handle dynamic 'Load more' buttons.
+
+    Args:
+        url: The trip URL to fetch.
+        cookie_file: Optional path to a saved cookies JSON file to apply before
+                     navigation (for authenticated pages).
 
     Returns the full page HTML (including <head>) after all dynamically loaded articles
     are fetched, or None if Playwright is not available. Note: Our Playwright approach
@@ -218,7 +510,17 @@ def _fetch_page_with_playwright(url: str) -> str | None:
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            )
+
+            # Apply saved cookies if provided (for authenticated pages)
+            if cookie_file and cookie_file.exists():
+                from urllib.parse import urlparse
+                domain = urlparse(url).netloc
+                _apply_cookies_to_playwright_context(context, cookie_file, domain)
+
+            page = context.new_page()
             page.goto(url, wait_until="networkidle", timeout=60000)
 
             # Close cookie popup if present (FindPenguins uses one)
@@ -294,6 +596,11 @@ def scrape_findpenguins_trip(
     url: str,
     output_base: Path = Path("imported"),
     use_browser: bool = True,
+    cookie_file: Path | None = None,
+    login_email: str | None = None,
+    login_password: str | None = None,
+    interactive_login: bool = False,
+    save_cookies: Path | None = None,
 ) -> None:
     """Scrape a FindPenguins trip and create TraceVoyage folder structure.
 
@@ -301,6 +608,11 @@ def scrape_findpenguins_trip(
         url: FindPenguins trip URL
         output_base: Base directory for output (default: 'imported')
         use_browser: Use Playwright browser for dynamic loading (default: True)
+        cookie_file: Path to a cookie file (JSON or Netscape format) to load
+        login_email: Email for programmatic login (requires Playwright)
+        login_password: Password for programmatic login (requires Playwright)
+        interactive_login: If True, open Playwright browser for manual login
+        save_cookies: Path to save cookies after successful login for reuse
     """
     parsed = urlparse(url)
     path_parts = [p for p in parsed.path.split('/') if p]
@@ -323,12 +635,38 @@ def scrape_findpenguins_trip(
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     })
 
+    # ── Login / Cookie handling ──────────────────────────────
+    pw_cookies: list[dict] | None = None
+
+    if login_email or interactive_login:
+        # Use Playwright for login
+        login_url = f"{parsed.scheme}://{parsed.netloc}/login"
+        log.info(f"Initiating login via {login_url}...")
+        pw_cookies = _playwright_login(
+            login_url=login_url,
+            email=login_email,
+            password=login_password,
+            interactive=interactive_login,
+            cookie_path=save_cookies or cookie_file,
+        )
+        if pw_cookies:
+            _apply_playwright_cookies_to_session(pw_cookies, session)
+        else:
+            log.warning("Login failed or no cookies obtained. Continuing without authentication.")
+
+    elif cookie_file and cookie_file.exists():
+        # Load cookies from file into the requests session
+        log.info(f"Loading cookies from {cookie_file}...")
+        load_cookies(cookie_file, session)
+
+    # ── Fetch the trip page ───────────────────────────────
+
     try:
         # Try Playwright first for dynamic loading, fall back to requests if unavailable
         html_content = None
         if use_browser:
             log.info("Fetching trip page with browser (for dynamic loading)...")
-            html_content = _fetch_page_with_playwright(url)
+            html_content = _fetch_page_with_playwright(url, cookie_file=cookie_file)
 
         if html_content is None:
             log.info("Fetching trip page with requests...")
@@ -535,8 +873,23 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Public trip (basic usage)
   python helpers/findpenguins_scraper.py https://findpenguins.com/karoc/trip/winter-is-coming
-  python helpers/findpenguins_scraper.py https://findpenguins.com/user/trip/my-trip --output data
+
+  # With cookie file (exported from browser)
+  python helpers/findpenguins_scraper.py https://findpenguins.com/user/trip/private-trip --cookies cookies.json
+
+  # Interactive login (opens browser for manual login)
+  python helpers/findpenguins_scraper.py https://findpenguins.com/user/trip/private-trip --interactive-login
+
+  # Programmatic login (email + password)
+  python helpers/findpenguins_scraper.py https://findpenguins.com/user/trip/private-trip --login-email user@example.com --login-password mypass
+
+  # Programmatic login with credentials from environment variables
+  python helpers/findpenguins_scraper.py https://findpenguins.com/user/trip/private-trip --login-env
+
+  # Save cookies after login for reuse
+  python helpers/findpenguins_scraper.py https://findpenguins.com/user/trip/private-trip --interactive-login --save-cookies cookies.json
         """
     )
     parser.add_argument(
@@ -559,6 +912,39 @@ Examples:
         help='Skip Playwright browser and use requests only (misses dynamically loaded content)'
     )
 
+    # ── Login / Cookie arguments ──
+    login_group = parser.add_argument_group('Authentication (for private trips)')
+    login_group.add_argument(
+        '--cookies',
+        metavar='FILE',
+        help='Path to cookie file (JSON from browser export or Netscape format)'
+    )
+    login_group.add_argument(
+        '--interactive-login',
+        action='store_true',
+        help='Open Playwright browser for manual interactive login'
+    )
+    login_group.add_argument(
+        '--login-email',
+        metavar='EMAIL',
+        help='Email for programmatic login (requires --login-password)'
+    )
+    login_group.add_argument(
+        '--login-password',
+        metavar='PASSWORD',
+        help='Password for programmatic login (or use FINDPENGUINS_PASSWORD env var)'
+    )
+    login_group.add_argument(
+        '--login-env',
+        action='store_true',
+        help='Read credentials from FINDPENGUINS_EMAIL and FINDPENGUINS_PASSWORD environment variables'
+    )
+    login_group.add_argument(
+        '--save-cookies',
+        metavar='FILE',
+        help='Save cookies to this file after successful login (for later reuse with --cookies)'
+    )
+
     args = parser.parse_args()
 
     if args.verbose:
@@ -566,13 +952,44 @@ Examples:
 
     output_path = Path(args.output)
     use_browser = not args.no_browser
+
     if not HAS_PLAYWRIGHT and use_browser:
         log.warning(
             "Playwright not installed. Install it with: pip install playwright\n"
             "Then run: playwright install chromium\n"
             "Falling back to requests (may miss dynamically loaded articles).")
 
-    scrape_findpenguins_trip(args.url, output_path, use_browser=use_browser)
+    # ── Resolve login parameters ──
+    cookie_file = Path(args.cookies) if args.cookies else None
+    login_email = args.login_email
+    login_password = args.login_password
+    interactive_login = args.interactive_login
+    save_cookies_path = Path(args.save_cookies) if args.save_cookies else None
+
+    if args.login_env:
+        login_email = os.environ.get('FINDPENGUINS_EMAIL', login_email)
+        login_password = os.environ.get('FINDPENGUINS_PASSWORD', login_password)
+
+    if (login_email and not login_password) or (not login_email and login_password):
+        parser.error("--login-email and --login-password must be used together")
+
+    if interactive_login and not HAS_PLAYWRIGHT:
+        log.error("Playwright is required for interactive login.")
+        sys.exit(1)
+
+    if (login_email or interactive_login) and not HAS_PLAYWRIGHT:
+        log.warning("Playwright is required for login. Falling back to cookie-only mode.")
+
+    scrape_findpenguins_trip(
+        args.url,
+        output_base=output_path,
+        use_browser=use_browser,
+        cookie_file=cookie_file,
+        login_email=login_email,
+        login_password=login_password,
+        interactive_login=interactive_login,
+        save_cookies=save_cookies_path,
+    )
 
 
 if __name__ == '__main__':
